@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"log"
 	"net/http"
 	"time"
 
@@ -8,11 +10,18 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/go-chi/cors"
 	"github.com/go-chi/httprate"
+	"github.com/jackc/pgx/v5"
 )
 
 func main() {
-	router := chi.NewRouter()
+	ctx := context.Background()
+	conn, err := pgx.Connect(ctx, "")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer conn.Close(ctx)
 
+	router := chi.NewRouter()
 	router.Use(middleware.CleanPath)
 	router.Use(middleware.Logger)
 	router.Use(middleware.Recoverer)
