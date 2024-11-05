@@ -5,13 +5,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"net"
 	"net/http"
 	"os"
 	"strings"
 	"time"
 
 	firebase "firebase.google.com/go/v4"
+	"firebase.google.com/go/v4/auth"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/go-chi/cors"
@@ -19,30 +19,72 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/jackc/pgx/v5"
 	"github.com/joho/godotenv"
+	"github.com/pkg/errors"
 	"github.com/redis/go-redis/v9"
 )
 
-var WS_Ticket_Duration = time.Duration(5) * time.Minute
-var JWT_Sign_Method = jwt.SigningMethodHS256
+var (
+	firebaseApp  *firebase.App
+	firebaseAuth *auth.Client
+	redisClient  *redis.Client
+)
 
-func getClientIP(req *http.Request) string {
-	forwarded := req.Header.Get("X-Forwarded-For")
-	if forwarded != "" {
-		ips := strings.Split(forwarded, ",")
-		clientIP := strings.TrimSpace(ips[0])
-		return clientIP
-	}
+func authenticate(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(res http.ResponseWriter, req *http.Request) {
+		bearerToken := req.Header.Get("Authorization")
+		if bearerToken == "" || strings.Contains(bearerToken, "Bearer") == false {
+			err := errors.New("invalid authorization header")
+			http.Error(res, err.Error(), http.StatusUnauthorized)
+			return
+		}
 
-	clientIP := req.Header.Get("X-Real-IP")
-	if clientIP != "" {
-		return clientIP
-	}
+		token, err := firebaseAuth.VerifyIDToken(context.Background(), strings.TrimPrefix(bearerToken, "Bearer "))
+		if err != nil {
+			err = errors.Wrap(err, "invalid id token")
+			http.Error(res, err.Error(), http.StatusUnauthorized)
+			return
+		}
 
-	clientIP, _, err := net.SplitHostPort(req.RemoteAddr)
+		ctx := context.WithValue(req.Context(), "userID", token.UID)
+		next.ServeHTTP(res, req.WithContext(ctx))
+	})
+}
+
+type TicketClaims struct {
+	ClientIP string `json:"clientIP"`
+	jwt.RegisteredClaims
+}
+
+func createTicketJWT(claims *TicketClaims) (string, error) {
+	JWT_SECRET := os.Getenv("JWT_SECRET")
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+
+	signedToken, err := token.SignedString([]byte(JWT_SECRET))
 	if err != nil {
-		return ""
+		return "", errors.Wrap(err, "signing ticket failed")
 	}
-	return clientIP
+
+	return signedToken, nil
+}
+
+type Ticket struct {
+	UserID   string `json:"userID"`
+	ClientIP string `json:"clientIP"`
+}
+
+func setTicket(key string, value *Ticket, expiration time.Duration) error {
+	ticketJSON, err := json.Marshal(value)
+	if err != nil {
+		return errors.Wrap(err, "encode ticket to JSON failed")
+	}
+
+	ctx := context.Background()
+	err = redisClient.Set(ctx, key, ticketJSON, expiration).Err()
+	if err != nil {
+		return errors.Wrap(err, "set ticket to redis failed")
+	}
+
+	return nil
 }
 
 func main() {
@@ -58,17 +100,17 @@ func main() {
 	}
 	defer conn.Close(ctx)
 
-	firebaseApp, err := firebase.NewApp(ctx, nil)
+	firebaseApp, err = firebase.NewApp(ctx, nil)
 	if err != nil {
 		log.Fatalf("error initializing app: %v\n", err)
 	}
 
-	firebaseAuth, err := firebaseApp.Auth(ctx)
+	firebaseAuth, err = firebaseApp.Auth(ctx)
 	if err != nil {
 		log.Fatalf("error getting Auth client: %v\n", err)
 	}
 
-	rdb := redis.NewClient(&redis.Options{
+	redisClient = redis.NewClient(&redis.Options{
 		Addr:     "localhost:6379",
 		Password: "",
 		DB:       0,
@@ -76,6 +118,7 @@ func main() {
 
 	router := chi.NewRouter()
 	router.Use(middleware.CleanPath)
+	router.Use(middleware.RealIP)
 	router.Use(middleware.Logger)
 	router.Use(middleware.Recoverer)
 	router.Use(httprate.LimitByIP(100, 1*time.Minute))
@@ -96,44 +139,22 @@ func main() {
 	})
 
 	router.Group(func(r chi.Router) {
-		r.Use(func(next http.Handler) http.Handler {
-			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				bearerToken := r.Header.Get("Authorization")
-				if bearerToken == "" || strings.Contains(bearerToken, "Bearer") == false {
-					w.WriteHeader(http.StatusUnauthorized)
-					log.Println("invalid authorization header")
-					return
-				}
-
-				token, err := firebaseAuth.VerifyIDToken(context.Background(), strings.TrimPrefix(bearerToken, "Bearer "))
-				if err != nil {
-					w.WriteHeader(http.StatusUnauthorized)
-					log.Println("invalid id token")
-					return
-				}
-
-				ctx := context.WithValue(r.Context(), "userID", token.UID)
-				next.ServeHTTP(w, r.WithContext(ctx))
-			})
-		})
+		r.Use(authenticate)
 
 		r.Get("/ws/ticket", func(res http.ResponseWriter, req *http.Request) {
 			userID := fmt.Sprintf("%v", req.Context().Value("userID"))
-			clientIP := getClientIP(req)
+			clientIP := req.RemoteAddr
 			hostname, err := os.Hostname()
 			if err != nil {
-				res.WriteHeader(http.StatusInternalServerError)
-				log.Println("get hostname failed", err)
+				err = errors.Wrap(err, "get hostname failed")
+				http.Error(res, err.Error(), http.StatusInternalServerError)
 				return
 			}
 
 			ticketDuration := time.Minute * 3
 			issuedAt := time.Now()
 			expiresAt := issuedAt.Add(ticketDuration)
-			claims := struct {
-				ClientIP string `json:"clientIP"`
-				jwt.RegisteredClaims
-			}{
+			claims := TicketClaims{
 				clientIP,
 				jwt.RegisteredClaims{
 					IssuedAt:  jwt.NewNumericDate(issuedAt),
@@ -143,33 +164,20 @@ func main() {
 				},
 			}
 
-			token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-			signedToken, err := token.SignedString([]byte(os.Getenv("JWT_SECRET")))
+			signedToken, err := createTicketJWT(&claims)
 			if err != nil {
-				res.WriteHeader(http.StatusInternalServerError)
-				log.Println("sign jwt failed", err)
+				http.Error(res, err.Error(), http.StatusInternalServerError)
 				return
 			}
 
-			ticket := struct {
-				UserID   string `json:"userID"`
-				ClientIP string `json:"clientIP"`
-			}{
+			ticket := Ticket{
 				UserID:   userID,
 				ClientIP: clientIP,
 			}
 
-			ticketJSON, err := json.Marshal(ticket)
+			err = setTicket(signedToken, &ticket, ticketDuration)
 			if err != nil {
-				res.WriteHeader(http.StatusInternalServerError)
-				log.Println("marshal ticket failed", err)
-				return
-			}
-
-			err = rdb.Set(context.Background(), signedToken, ticketJSON, ticketDuration).Err()
-			if err != nil {
-				res.WriteHeader(http.StatusInternalServerError)
-				log.Println("set ticket to redis failed", err)
+				http.Error(res, err.Error(), http.StatusInternalServerError)
 				return
 			}
 
@@ -178,10 +186,11 @@ func main() {
 			}{
 				Ticket: signedToken,
 			}
+
 			resBodyJSON, err := json.Marshal(resBody)
 			if err != nil {
-				res.WriteHeader(http.StatusInternalServerError)
-				log.Println("marshal res body failed", err)
+				err = errors.Wrap(err, "encode res body to JSON failed")
+				http.Error(res, err.Error(), http.StatusInternalServerError)
 				return
 			}
 
