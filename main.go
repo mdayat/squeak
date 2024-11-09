@@ -24,7 +24,6 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	"github.com/rs/zerolog/pkgerrors"
-	"gopkg.in/natefinch/lumberjack.v2"
 )
 
 var (
@@ -199,37 +198,6 @@ func websocketTicketHandler(res http.ResponseWriter, req *http.Request) {
 	res.Write(resBodyJSON)
 }
 
-func setupLogger(logOutput string) zerolog.Logger {
-	switch logOutput {
-	case "stdout":
-		return zerolog.New(os.Stdout).With().Timestamp().Logger()
-
-	case "file":
-		lumberjackLogger := lumberjack.Logger{
-			Filename:   "./logs/squeak.log",
-			MaxSize:    10,
-			MaxBackups: 3,
-			MaxAge:     28,
-			Compress:   true,
-		}
-		return zerolog.New(&lumberjackLogger).With().Timestamp().Logger()
-
-	case "both":
-		lumberjackLogger := lumberjack.Logger{
-			Filename:   "./logs/squeak.log",
-			MaxSize:    10,
-			MaxBackups: 3,
-			MaxAge:     28,
-			Compress:   true,
-		}
-		multiWriters := zerolog.MultiLevelWriter(os.Stdout, &lumberjackLogger)
-		return zerolog.New(multiWriters).With().Timestamp().Logger()
-
-	default:
-		return zerolog.New(os.Stdout).With().Timestamp().Logger()
-	}
-}
-
 func main() {
 	err := godotenv.Load()
 	if err != nil {
@@ -238,9 +206,6 @@ func main() {
 
 	zerolog.TimeFieldFormat = zerolog.TimeFormatUnix
 	zerolog.ErrorStackMarshaler = pkgerrors.MarshalStack
-
-	logOutput := os.Getenv("LOG_OUTPUT")
-	log.Logger = setupLogger(logOutput)
 
 	ctx := context.Background()
 	conn, err := pgx.Connect(ctx, os.Getenv("DATABASE_URL"))
@@ -260,7 +225,7 @@ func main() {
 	}
 
 	redisClient = redis.NewClient(&redis.Options{
-		Addr:     "localhost:6379",
+		Addr:     os.Getenv("REDIS_URL"),
 		Password: "",
 		DB:       0,
 	})
@@ -288,5 +253,5 @@ func main() {
 		r.Get("/ws/ticket", websocketTicketHandler)
 	})
 
-	http.ListenAndServe(":3000", router)
+	http.ListenAndServe(":80", router)
 }
