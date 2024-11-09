@@ -1,5 +1,3 @@
 dist
 .env*
 service-account-file.json
-dump.rdb
-logs
