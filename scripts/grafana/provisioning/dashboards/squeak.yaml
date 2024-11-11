@@ -1,9 +1,9 @@
 apiVersion: 1
 providers:
-  - allowUiUpdates: true
+  - name: squeak
+    allowUiUpdates: true
     disableDeletion: false
-    name: squeak
-    options:
-      foldersFromFilesStructure: true
-      path: /etc/grafana/squeak-dashboards
     updateIntervalSeconds: 10
+    options:
+      path: /etc/grafana/squeak-dashboards
+      foldersFromFilesStructure: true
