@@ -24,6 +24,14 @@ services:
         source: ./scripts/fluentbit/fluent-bit.conf
         target: /fluent-bit/etc/fluent-bit.conf
 
+  loki:
+    image: grafana/loki:3.2.1
+    ports:
+      - "3100:3100"
+    volumes:
+      - ./scripts/loki:/etc/loki
+    command: -config.file=/etc/loki/config.yaml
+
   redis:
     image: redis:7.4.1-alpine
     ports:
@@ -35,6 +43,8 @@ services:
       - 80:80
     depends_on:
       redis:
+        condition: service_started
+      fluentbit:
         condition: service_started
     environment:
       - REDIS_URL=redis:6379
